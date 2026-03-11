@@ -1,0 +1,86 @@
+/* Import handwriting font for heading only */
+@import url('https://fonts.googleapis.com/css2?family=Dancing+Script:wght@700&display=swap');
+
+body, html {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  width: 100%;
+  font-family: Arial, sans-serif; /* normal straight font for all text */
+}
+
+.dashboard-bg {
+  background: linear-gradient(to bottom, white, #30a3b0);
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding-top: 100px;
+}
+
+.header {
+  font-family: 'Dancing Script', cursive; /* heading font */
+  font-size: 8rem;                        /* very big */
+  font-style: italic;                      /* slanted */
+  font-weight: 700;
+  color: black;
+  text-align: center;
+  margin-bottom: 20px;
+}
+
+.search-bar {
+  padding: 10px 15px;
+  width: 300px;
+  border-radius: 50px;
+  border: none;
+  box-shadow: 0px 2px 5px rgba(0,0,0,0.2);
+  text-align: center;
+  margin-bottom: 30px;
+  font-size: 1rem;
+  font-family: Arial, sans-serif; /* normal straight font */
+}
+
+.claim-card {
+  background-color: white;
+  border-radius: 15px;
+  padding: 15px;
+  width: 350px;
+  margin-bottom: 20px;
+  box-shadow: 0px 3px 7px rgba(0,0,0,0.2);
+  font-family: Arial, sans-serif; /* normal straight font */
+  font-size: 1rem;
+}
+
+.claim-card .verdict {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.claim-card .language {
+  color: gray;
+  font-size: 0.9rem;
+}
+
+.claim-card .buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.claim-card button {
+  padding: 5px 10px;
+  border-radius: 5px;
+  border: none;
+  color: white;
+  cursor: pointer;
+}
+
+.claim-card .approve {
+  background-color: #4CAF50;
+}
+
+.claim-card .reject {
+  background-color: #F44336;
+}
