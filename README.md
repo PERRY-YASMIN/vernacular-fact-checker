@@ -1,988 +1,698 @@
----
-name: fact-checker-architecture
-overview: Design of a high-throughput multilingual automated fact-checking system for Indian vernacular content, including architecture, pipeline, and detailed team responsibilities.
-todos:
-  - id: backend-core-apis
-    content: Implement core FastAPI backend, DB schema, and message-driven workers for ingestion and fact-checking.
-    status: pending
-  - id: ml-pipeline-core
-    content: Develop multilingual preprocessing, claim extraction, retrieval, and verification ML modules.
-    status: pending
-  - id: frontend-dashboard
-    content: Build React-based dashboard for live monitoring, claim review, and fact database management.
-    status: pending
-isProject: false
----
+# Vernacular Fact-Checker
 
-# Automated Vernacular Fact-Checking System – Architecture & Plan
+## 1. Project Overview
 
-## 1. High-level system architecture & pipeline stages
+### Purpose
 
+Vernacular Fact-Checker is a full-stack multilingual fact-checking system designed to process short-form social media style text, extract factual claims, retrieve relevant evidence from a verified knowledge base, and return a verification verdict with confidence and supporting sources.
 
+### Problem It Solves
 
+The project targets misinformation and unverifiable viral content that appears in English, Hindi, and mixed-language Indian social content. In practice, these posts often include conversational fluff such as emojis, hashtags, forwarding requests, and informal phrasing. The system removes that noise, identifies claim-like text, and performs cross-lingual fact verification without requiring manual translation.
 
+### Current Scope
 
-### 1.1 Stages
+The repository currently implements:
 
-- **Ingestion layer**
-  - Connectors to Twitter/X, Facebook, Instagram, YouTube comments, WhatsApp-like proxies (if any), and news sites (RSS, sitemaps, HTML scrapers).
-  - Write normalized `RawPost` records into `kafka_topic_raw_posts` (or similar message queue) with metadata (source, language hint, timestamp, geo, engagement, author).
-- **Preprocessing & claim extraction layer**
-  - **Language detection & transliteration**: detect language + script (e.g., Hindi in Devanagari vs Latin), transliterate to canonical script for some models.
-  - **Normalization & cleaning**: remove URLs, emojis (optional), HTML, excessive punctuation; normalize Unicode; standardize hashtags/usernames.
-  - **Fluff & irrelevant text filtering**: remove greetings, sign-offs, discourse markers, and non-claim chatter; score sentences for claim-likeness.
-  - **Claim segmentation & extraction**: split text into sentences/clauses; identify and extract check-worthy factual claims.
-  - **Output**: `Claim` records (claim text, language, source_post_id, entities, time, geo, topic) to `kafka_topic_claims`.
-- **Fact retrieval & verification layer**
-  - **Hybrid retrieval** from fact DB: BM25 + dense embeddings (vector search) + optional keyword filters.
-  - **Context construction**: build a context bundle of top-k candidate facts + evidence, normalized entities, and metadata (time, place).
-  - **Verification**: ML or rule-based labeler decides {Supported, Refuted, NotEnoughEvidence, NeedsReview} and assigns confidence.
-  - **Misinformation detection**: flag posts/claims that are refuted or unknown but potentially dangerous (e.g., health/election-related, viral).
-  - **Output**: `FactCheckResult` records to `kafka_topic_results` and persisted in DB.
-- **API & presentation layer**
-  - **Backend API (FastAPI)** to:
-    - Query fact-check results by post URL, ID, or text.
-    - Provide search UI for fact-checkers.
-    - Expose admin tools to manage fact DB.
-  - **Frontend dashboard** (React) for:
-    - Monitoring live stream of claims and statuses.
-    - Manual review/override of low-confidence cases.
-    - Annotation interface for building the verified fact database.
-- **Storage & infrastructure**
-  - **Operational store**: PostgreSQL (claims, posts, results, users, annotations, jobs).
-  - **Search**: Elasticsearch/OpenSearch for keyword + filters.
-  - **Vector store**: FAISS / Milvus for dense embeddings of claims/facts.
-  - **Object storage**: MinIO/S3 for raw HTML, screenshots, training data dumps.
-  - **Orchestration/Deployment**: Docker + Kubernetes (or docker-compose for student scope), Prometheus/Grafana for metrics.
+- A FastAPI backend for ingestion, claim extraction, and claim verification.
+- An ML layer for text cleaning, claim extraction, embedding-based retrieval, and multilingual NLI-based verification.
+- A React + Vite frontend for entering a claim and viewing the returned verdict, confidence, and sources.
+- A SQLModel-based persistence layer for posts, extracted claims, and stored verdicts.
+- A bilingual fact base and test samples for English and Hindi verification.
 
----
+The repository also includes dependencies for Redis and Kafka, but those are not currently wired into the active request flow.
 
-## 2. Methods for high-throughput processing (thousands of posts/min)
+## 2. Requirements
 
-- **Message queues for decoupling**
-  - **Kafka or Redpanda** topics per stage: `raw_posts`, `normalized_posts`, `claims`, `results`.
-  - Consumers scaled horizontally; partitions align with throughput needs.
-- **Horizontal scaling of stateless workers**
-  - Microservices or modular workers:
-    - `ingest-service`, `preprocess-service`, `claim-extractor-service`, `retriever-service`, `verifier-service`.
-  - Each runs multiple replicas behind a queue; scale out by running more replicas.
-- **Batch & micro-batch processing**
-  - Process messages in small batches (e.g., 16–128 posts) to exploit vectorization in NLP models (PyTorch batch inference).
-  - Group by language to reduce model switching overhead.
-- **Asynchronous I/O and concurrency**
-  - Use **async FastAPI** for APIs.
-  - Workers use async HTTP clients for external APIs, non-blocking DB drivers where possible.
-- **Caching**
-  - Redis cache for:
-    - Popular posts and their results.
-    - Recently computed embeddings of common text fragments (e.g., viral messages forwarded multiple times).
-    - Frequently used fact entries and retrieval results.
-- **Backpressure & prioritization**
-  - Kafka consumer groups with max poll interval + lag monitoring.
-  - Prioritize high-impact sources (e.g., verified political accounts, highly shared URLs) using priority queues or separate topics.
-- **Observability**
-  - Metrics: per-stage throughput, latency histograms, error rates, queue lag, GPU utilization.
-  - Logs: structured JSON logs for each worker; correlation IDs for tracing per post/claim.
+### 2.1 System Requirements
 
----
+| Area | Requirement | Notes |
+| --- | --- | --- |
+| Operating system | Windows, Linux, or macOS | Current workspace usage is on Windows. |
+| Python | Python 3.12 recommended | Current configured environment is Python 3.12.10. |
+| Node.js | Modern Node.js runtime recommended, preferably Node 20+ | The frontend does not pin an engine version, but Vite 7 and current TypeScript tooling expect a modern Node runtime. |
+| Package managers | `pip`, `npm` | Used for backend/ML and frontend respectively. |
+| Database | SQLite for local development, PostgreSQL-compatible setup possible | The backend uses `SQLModel` and reads `DATABASE_URL` from environment. |
+| ML runtime | CPU supported, CUDA optional | The ML config uses GPU automatically when `torch.cuda.is_available()` is true. |
+| Internet access | Required for first model download unless models are already cached locally | Hugging Face models are loaded lazily on first use. |
 
-## 3. Techniques to maintain context accuracy in the fact database
+### 2.2 Backend Dependencies
 
-- **Fact schema design**
-  - `Fact` entity fields:
-    - `id`, `canonical_claim_text`, `language`, `translations`.
-    - `entities` (linked to entity store), `time_validity` (from/to), `geo_scope` (country/state/city).
-    - `source` (fact-checking org, article URL, evidence URLs), `verdict` (True/False/Misleading/etc.).
-    - `topic_tags` (health, politics, crime, finance, religion, etc.).
-- **Entity-centric modeling**
-  - Separate `Entity` table (persons, orgs, places, events) with aliases across languages and scripts.
-  - Use NER + entity linker to map claims to entities; retrieval is then entity-aware.
-- **Time & geography-aware retrieval**
-  - Include time and geo filters in retrieval queries.
-  - Example: claim about “fuel price now” should prioritize recent facts from the same country/state.
-- **Hybrid retrieval for context accuracy**
-  - **BM25 (Elasticsearch)** on normalized text, plus filters on language, topic, time.
-  - **Dense retrieval (FAISS/Milvus)** using multilingual encoders (e.g., XLM-R, IndicBERT) for semantic similarity across languages.
-  - **Re-ranking** with cross-encoder models that take `[claim, fact]` pairs and output relevance scores.
-- **Normalization & canonicalization pipeline for new facts**
-  - When ingesting new verified facts:
-    - Normalize text (same preprocessing as incoming claims).
-    - Extract entities, time, location, topics.
-    - Generate embeddings for canonical claim and translations.
-    - Store full provenance (links to sources, authors, publication date).
-- **Human-in-the-loop review**
-  - UI to approve/edit canonical claims, correct entities, and mark duplicates.
-  - Periodic deduplication job to merge semantically identical facts across languages.
-- **Versioning & auditability**
-  - Maintain version history for each fact.
-  - Store which model version produced which verdict for reproducibility.
+Defined in [backend/requirements.txt](project-integration/vernacular-fact-checker/backend/requirements.txt):
 
----
+| Package | Role |
+| --- | --- |
+| `fastapi` | API framework |
+| `uvicorn` | ASGI server |
+| `pydantic` | Validation |
+| `pydantic-settings` | Environment-based settings |
+| `python-dotenv` | `.env` support |
+| `sqlalchemy` | ORM foundation used under SQLModel |
+| `sqlmodel` | Models and session management |
+| `psycopg2-binary` | PostgreSQL driver |
+| `redis` | Optional future caching/integration |
+| `kafka-python` | Optional future messaging/integration |
 
-## 4. NLP methods to remove conversational fluff and irrelevant text
+### 2.3 ML Dependencies
 
-- **Rule-based preprocessing**
-  - Regex and heuristics to strip:
-    - Greetings ("good morning", "namaste", "salaam", equivalents in Indian languages).
-    - Courtesy phrases ("please share", "forward this", "subscribe", "like/comment/share").
-    - User mentions, hashtags (optionally keep content words from hashtags), emojis, excessive punctuation.
-- **Sentence segmentation and classification**
-  - Split text into sentences/clauses using language-specific sentence boundary detection (Indic NLP library, spaCy models, or rule-based for resource-poor languages).
-  - Train a **binary classifier** (claim vs non-claim) on sentences:
-    - Models: small transformers (e.g., `xlm-roberta-base`, `indic-bert`) fine-tuned for claim detection.
-    - Negative examples: jokes, opinions, questions without factual assertions, chit-chat.
-- **Claim-worthiness scoring**
-  - Multi-class classifier to rank sentences by check-worthiness (e.g., elections, public health, communal issues).
-  - Use thresholds to drop low-scoring sentences.
-- **Dependency & POS-based heuristics**
-  - Use syntactic patterns to ensure factual assertions (presence of verbs, entities, numbers, dates).
-  - Filter out isolated nouns or fragments (e.g., just a URL or hashtag cloud).
-- **Summarization for long posts**
-  - For long rants or threads, use extractive summarization based on claim-worthiness scores to reduce to a few key factual sentences before retrieval.
-- **Template & keyword filters**
-  - Maintain lists of generic phrases (e.g., "like and share", "I think", "in my opinion") in multiple languages to downweight/remove those segments.
+Defined in [ml/requirements-ml.txt](project-integration/vernacular-fact-checker/ml/requirements-ml.txt):
 
----
+| Package | Role |
+| --- | --- |
+| `numpy` | Numeric operations |
+| `pandas` | Dataset loading and preprocessing |
+| `scikit-learn` | Claim detector training and cosine similarity utilities |
+| `joblib` | Persisting claim detector artifacts |
+| `torch` | Model execution and fine-tuning |
+| `transformers` | Multilingual verifier model loading and inference |
+| `sentence-transformers` | LaBSE embeddings |
+| `huggingface-hub` | Model download and cache management |
+| `sentencepiece` | Tokenization support |
+| `protobuf` | Model/runtime dependency |
+| `py3langid` | Language identification |
+| `indic-nlp-library` | Indic-language text processing support |
+| `regex` | Emoji and Unicode-aware cleanup |
+| `unidecode` | ASCII normalization for Latin-only text |
+| `pytest` | Testing |
 
-## 5. Strategies for multilingual processing for Indian languages
+### 2.4 Frontend Dependencies
 
-- **Language & script detection**
-  - Use fast language ID (fastText langid models) trained/fine-tuned for Indian languages.
-  - Detect script (Devanagari, Latin, Bengali, Gurmukhi, etc.) via Unicode ranges.
-- **Transliteration & normalization**
-  - For code-mixed and Romanized Indian languages, use transliteration libraries or sequence models to map to native scripts (e.g., Hindi Latin → Devanagari).
-  - Normalize spacing, digits (Devanagari numerals → ASCII), dates, and currency formats.
-- **Shared multilingual encoders**
-  - Use models like **IndicBERT, MuRIL, XLM-R** so that semantically similar claims in different languages are mapped to nearby vector space locations.
-  - Fine-tune for retrieval and classification tasks (claim detection, stance classification) with multilingual datasets.
-- **Language-specific components where needed**
-  - Per-language stopword lists, punctuation rules, and slang dictionaries.
-  - Optional per-language light stemmers or lemmatizers.
-- **Code-mixing handling**
-  - Identify mixed-language stretches at the token level; route to models fine-tuned on code-mixed data.
-  - Use token-level language tags to help models disambiguate.
-- **Multilingual fact DB**
-  - Store canonical fact in primary language plus translations.
-  - For retrieval, search across all languages using embeddings; but apply language preferences (e.g., prefer same-language evidence first, then cross-lingual).
-- **Evaluation per language**
-  - Track precision/recall by language and key dialect groups to avoid underperformance on low-resource languages.
+Defined in [frontend/factcheck-frontend/package.json](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/package.json):
 
----
+| Package | Role |
+| --- | --- |
+| `react` | UI library |
+| `react-dom` | DOM rendering |
+| `vite` | Dev server and build tool |
+| `typescript` | Static typing |
+| `@vitejs/plugin-react` | React support for Vite |
+| `eslint` and related plugins | Linting |
+| `tailwindcss`, `postcss`, `autoprefixer` | Styling toolchain available in the project |
 
-## 6. Recommended tools, frameworks, and ML models
+## 3. Architecture
 
-- **Programming & frameworks**
-  - **Python 3.11+** as main language.
-  - **FastAPI** for backend APIs.
-  - **Kafka/Redpanda** for streaming; alternatively **RabbitMQ** for smaller-scale student deployments.
-  - **Celery + Redis** or **Kafka consumer workers** for background processing.
-  - **PostgreSQL** for relational data.
-  - **Elasticsearch/OpenSearch** for full-text + BM25 retrieval.
-  - **FAISS or Milvus** for vector similarity search.
-- **NLP & ML**
-  - **PyTorch** / **HuggingFace Transformers** for model training/inference.
-  - **spaCy** for tokenization, NER (where models exist), custom pipelines; integrate with Indic NLP tools.
-  - **Indic NLP Library** and similar projects for tokenization, transliteration, and script handling for Indian languages.
-- **Candidate models** (for student-friendly setup)
-  - Language-agnostic sentence embeddings: `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`.
-  - Indic-focused: `ai4bharat/indic-bert`, `google/muril-base-cased`, `xlm-roberta-base` fine-tuned.
-  - Claim detection / stance classification: fine-tune above encoders on claim datasets (e.g., FakeNewsNet, ClaimBuster-like sources, Indian fact-check corpora where available).
-- **Frontend**
-  - **React + TypeScript** with **Vite** or **Next.js**.
-  - UI: **Tailwind CSS** or **Material UI**.
-  - Charts/metrics: **Recharts**, **Chart.js**, or **ECharts**.
-- **DevOps & tooling**
-  - **Docker** for containerization; **docker-compose** for local.
-  - **GitHub Actions** or **GitLab CI** for CI/CD.
-  - **Poetry** or **pip + requirements.txt** for Python deps.
+### 3.1 High-Level Architecture
 
----
+The implemented system has four main layers:
 
-## 7. Example project folder structure
+1. Frontend UI
+2. FastAPI backend
+3. ML inference and training modules
+4. Database and fact knowledge base
 
-- **Root**
-  - `backend/`
-    - `app/`
-      - `main.py` (FastAPI entrypoint)
-      - `api/`
-        - `routes_posts.py`
-        - `routes_claims.py`
-        - `routes_facts.py`
-        - `routes_admin.py`
-      - `core/`
-        - `config.py`
-        - `logging.py`
-      - `models/`
-        - `post.py`
-        - `claim.py`
-        - `fact.py`
-        - `fact_check_result.py`
-        - `user.py`
-      - `db/`
-        - `session.py`
-        - `schemas.sql` or Alembic migrations
-      - `services/`
-        - `ingest_service.py`
-        - `preprocess_service.py`
-        - `claim_extractor_service.py`
-        - `retrieval_service.py`
-        - `verification_service.py`
-        - `cache_service.py`
-      - `workers/`
-        - `kafka_consumer_claims.py`
-        - `kafka_consumer_results.py`
-      - `tests/`
-    - `Dockerfile`
-    - `requirements.txt`
-  - `ml/`
-    - `notebooks/`
-    - `data/` (small samples; big data in external storage)
-    - `models/`
-      - `claim_detector/`
-      - `stance_classifier/`
-      - `retriever_encoder/`
-    - `training/`
-      - `train_claim_detector.py`
-      - `train_stance_classifier.py`
-    - `inference/`
-      - `claim_detector.py`
-      - `fluff_filter.py`
-      - `embedder.py`
-      - `retrieval_pipeline.py`
-  - `frontend/`
-    - `src/`
-      - `App.tsx`
-      - `components/`
-        - `LiveFeed.tsx`
-        - `ClaimCard.tsx`
-        - `FactCheckDetail.tsx`
-        - `FiltersPanel.tsx`
-        - `AnnotationForm.tsx`
-      - `pages/`
-        - `Dashboard.tsx`
-        - `ClaimReview.tsx`
-        - `FactDatabase.tsx`
-      - `services/`
-        - `api.ts` (REST client)
-    - `public/`
-    - `package.json`
-  - `infra/`
-    - `docker-compose.yml`
-    - `k8s/` (optional manifests)
-  - `docs/`
-    - `architecture.md`
-    - `api-spec.md`
-    - `ml-design.md`
-  - `README.md`
+### 3.2 High-Level System Diagram Explanation
 
----
-
-## 8. Team structure and work division
-
-### 8.1 Member A – Backend Engineer
-
-- **Responsibilities**
-  - Design and implement the backend services, REST APIs, and message-driven workers.
-  - Integrate with Kafka/Redis, PostgreSQL, Elasticsearch, FAISS/Milvus (through ML engineer’s modules).
-  - Implement authentication/authorization for internal dashboard.
-  - Expose endpoints for ingestion, fact-check results, fact DB management, and annotations.
-  - Implement monitoring, logging, and basic rate limiting.
-- **Key technologies**
-  - Python, FastAPI, Pydantic.
-  - Kafka (or Redis Streams/RabbitMQ for simpler setup).
-  - PostgreSQL, SQLAlchemy/SQLModel.
-  - Elasticsearch/OpenSearch client.
-  - Redis for caching.
-  - Docker, docker-compose.
-- **Step-by-step tasks**
-  1. **Core backend scaffold**
-    - Initialize `backend/` FastAPI project with environment-based config.
-    - Set up DB connection (PostgreSQL) and ORM models for posts, claims, facts, results, users.
-  2. **API design & implementation**
-    - Implement `GET /health`, `GET /stats` for monitoring.
-    - Implement APIs:
-      - `POST /ingest/post` (for testing/manual input).
-      - `GET /posts/{id}` and `GET /claims/{id}`.
-      - `GET /fact-check` with query by text or URL.
-      - Admin endpoints for CRUD on facts and users.
-  3. **Messaging and workers**
-    - Implement Kafka consumer/producer wrappers.
-    - Build workers to:
-      - Read from `raw_posts` and call ML preprocessing/claim extraction (via ML modules).
-      - Read claims from `claims` and call retrieval/verification ML modules.
-      - Save results to DB and publish to `results` topic.
-  4. **Caching and performance**
-    - Integrate Redis caching for hot results and metadata.
-    - Add simple request-level caching for the most common queries.
-  5. **Security & auth**
-    - Implement JWT-based auth for internal dashboard APIs.
-  6. **Monitoring & logging**
-    - Add structured logging middleware.
-    - Add Prometheus metrics endpoints if time allows.
-- **Files/modules Member A will create**
-  - `backend/app/main.py`
-  - `backend/app/core/config.py`, `logging.py`
-  - `backend/app/models/{post,claim,fact,fact_check_result,user}.py`
-  - `backend/app/api/{routes_posts,routes_claims,routes_facts,routes_admin}.py`
-  - `backend/app/services/{ingest_service,preprocess_service,claim_extractor_service,retrieval_service,verification_service,cache_service}.py`
-  - `backend/app/workers/{kafka_consumer_claims,kafka_consumer_results}.py`
-  - `backend/requirements.txt`
-- **Expected outputs**
-  - Running backend service exposing REST APIs and Kafka workers.
-  - Database schema for posts/claims/facts/results.
-  - Internal documentation in `docs/api-spec.md` describing endpoints.
-- **Integration with others**
-  - Consumes ML modules from Member C as Python packages/modules (`ml/inference/`*).
-  - Provides HTTP APIs for Member B’s frontend and annotation UI.
-  - Exposes admin endpoints to let Member C update fact DB and trigger re-indexing.
-
----
-
-### 8.2 Member B – Frontend Engineer
-
-- **Responsibilities**
-  - Build the web dashboard for monitoring streams, reviewing claims, and managing facts.
-  - Implement UI components for browsing posts, viewing fact-check results, and annotating new facts.
-  - Provide clear UX for multilingual content and filtering.
-  - Integrate with backend APIs for live updates (polling or websockets if added later).
-- **Key technologies**
-  - React + TypeScript.
-  - Tailwind CSS or Material UI.
-  - Axios or Fetch for API calls.
-  - Vite/Next.js for build/dev environment.
-- **Step-by-step tasks**
-  1. **Project setup**
-    - Initialize React + TypeScript project in `frontend/`.
-    - Configure routing (e.g., React Router).
-  2. **Design system & layout**
-    - Create core layout: navbar, sidebar, main content area.
-    - Define color palette and typography suitable for data-heavy dashboards.
-  3. **Dashboard views**
-    - `Dashboard` page:
-      - Live table/stream of latest claims with status, language, source.
-      - Filters by language, verdict, confidence, topic.
-    - `ClaimReview` page:
-      - Detail view showing original post text, extracted claims, evidence facts, model verdict, and confidence.
-      - Controls to approve/override, assign labels for training data.
-    - `FactDatabase` page:
-      - Search and browse verified facts.
-      - Form to add/edit facts (including language, entities, time/geo scope).
-  4. **API integration**
-    - Implement `frontend/src/services/api.ts` to talk to backend endpoints (Member A).
-    - Map responses to TypeScript types.
-  5. **User auth UI**
-    - Basic login form, token storage, and logout.
-  6. **UX enhancements & validation**
-    - Loading states, error handling, pagination.
-    - Indicate model confidence visually (e.g., colored badges).
-- **Files/modules Member B will create**
-  - `frontend/src/App.tsx`
-  - `frontend/src/pages/{Dashboard,ClaimReview,FactDatabase}.tsx`
-  - `frontend/src/components/{LiveFeed,ClaimCard,FactCheckDetail,FiltersPanel,AnnotationForm,Navbar,Sidebar}.tsx`
-  - `frontend/src/services/api.ts`
-  - `frontend/package.json`, config files.
-- **Expected outputs**
-  - Working single-page dashboard that interacts with backend APIs.
-  - Annotation interface for fact-checkers to label claims and add facts.
-  - Basic styling and responsive layout.
-- **Integration with others**
-  - Uses backend REST APIs from Member A for data.
-  - Sends annotation data (labeled claims, new facts) that Member C can use to improve models.
-  - Displays language, confidence, and model outputs provided by Member C’s modules via backend.
-
----
-
-### 8.3 Member C – ML/Data Engineer
-
-- **Responsibilities**
-  - Design and implement all NLP/ML components: preprocessing, language detection, fluff removal, claim extraction, retrieval, and verification.
-  - Build and maintain the fact database’s indexing (text + vector) pipelines.
-  - Prepare datasets, train/fine-tune models, and ship inference modules consumable by backend.
-- **Key technologies**
-  - Python, Jupyter notebooks.
-  - PyTorch, HuggingFace Transformers.
-  - spaCy, Indic NLP Library.
-  - FAISS or Milvus for vector search.
-  - Pandas, scikit-learn for data prep and basic baselines.
-- **Step-by-step tasks**
-  1. **Data collection & preprocessing**
-    - Collect sample datasets from public Indian fact-checking sites and open datasets.
-    - Build scripts to parse, clean, and normalize text (multi-language support).
-  2. **Language/script detection module**
-    - Train/finetune or adopt existing lang ID model for Indic languages.
-    - Implement `detect_language(text)` and `detect_script(text)` functions.
-  3. **Fluff filtering & claim detection**
-    - Implement heuristic cleaner (remove URLs, emojis, boilerplate phrases in multiple languages).
-    - Create labeled dataset for claim vs non-claim at sentence level.
-    - Fine-tune a small multilingual transformer as claim detector; export inference code.
-  4. **Claim extraction pipeline**
-    - Combine sentence splitter + claim detector to output structured `Claim` objects.
-  5. **Retrieval pipeline**
-    - Choose embedding model (e.g., XLM-R or IndicBERT-based sentence transformer).
-    - Build scripts to index verified facts into FAISS/Milvus + Elasticsearch.
-    - Implement hybrid retrieval: BM25 + vector similarity + re-ranking.
-  6. **Verification / stance classification**
-    - Train model to classify [claim, fact] pairs as Supported / Refuted / NotEnoughEvidence.
-    - Implement scoring and threshold tuning.
-  7. **Packaging & integration**
-    - Wrap all inference code into lightweight modules callable from backend:
-      - `ml/inference/claim_detector.py`
-      - `ml/inference/fluff_filter.py`
-      - `ml/inference/embedder.py`
-      - `ml/inference/retrieval_pipeline.py`
-      - `ml/inference/verifier.py`
-    - Provide clear function signatures and configuration options.
-  8. **Evaluation & monitoring**
-    - Define evaluation metrics per language (precision/recall/F1 for claim detection, retrieval quality, stance classification).
-    - Provide evaluation scripts and reports.
-- **Files/modules Member C will create**
-  - `ml/notebooks/*.ipynb` for experiments.
-  - `ml/data_preparation/*.py` for scraping and preprocessing.
-  - `ml/training/{train_claim_detector.py,train_stance_classifier.py}`.
-  - `ml/inference/{claim_detector.py,fluff_filter.py,embedder.py,retrieval_pipeline.py,verifier.py}`.
-  - `ml/models/` storing checkpoints (small for repo, larger in external storage).
-  - `docs/ml-design.md` documenting model choices and pipelines.
-- **Expected outputs**
-  - Trained or fine-tuned models (or configured open models) for:
-    - Language detection (or integrated third-party model).
-    - Claim detection and claim-worthiness.
-    - Retrieval embeddings and hybrid retrieval.
-    - Stance classification / verification.
-  - Reusable Python modules for inference, ready to be imported by backend services.
-- **Integration with others**
-  - Provides Python inference APIs and config files to Member A for integration in workers.
-  - Supplies evaluation metrics and guidelines so Member B can surface model performance in the UI.
-  - Consumes annotation data (labels, new facts) from frontend/ backend to retrain/refine models.
-
----
-
-## 9. Suggested initial milestones (for the team)
-
-- **Milestone 1 – Skeleton system (Week 1–2)**
-  - Backend: health APIs, DB schema, minimal ingest + result endpoints.
-  - Frontend: static dashboard mock with dummy data.
-  - ML: basic preprocessing, off-the-shelf multilingual embeddings, trivial keyword-based retrieval.
-- **Milestone 2 – End-to-end MVP (Week 3–4)**
-  - Claim extraction and simple verification in one or two languages (e.g., Hindi + English).
-  - Kafka-based pipeline wired up with at least one ingestion source.
-  - Dashboard shows live claims and verdicts.
-- **Milestone 3 – Multilingual & optimization (Week 5–6)**
-  - Add more Indian languages and better claim detection.
-  - Implement fluff removal, hybrid retrieval, and time/geo-aware filters.
-  - Improve UI for annotation and incorporate feedback loop into ML training.
-
-
----
-name: fact-checker-architecture
-overview: Design of a high-throughput multilingual automated fact-checking system for Indian vernacular content, including architecture, pipeline, and detailed team responsibilities.
-todos:
-  - id: backend-core-apis
-    content: Implement core FastAPI backend, DB schema, and message-driven workers for ingestion and fact-checking.
-    status: pending
-  - id: ml-pipeline-core
-    content: Develop multilingual preprocessing, claim extraction, retrieval, and verification ML modules.
-    status: pending
-  - id: frontend-dashboard
-    content: Build React-based dashboard for live monitoring, claim review, and fact database management.
-    status: pending
-isProject: false
----
-
-# Automated Vernacular Fact-Checking System – Architecture & Plan
-
-## 1. High-level system architecture & pipeline stages
-
-```mermaid
-flowchart LR
-  subgraph ingestLayer [Ingestion Layer]
-    socialAPIs[SocialFeedIngestor]
-    rssIngest[NewsRSSIngestor]
-    webScraper[WebScraper]
-    queueIn[kafka_topic_raw_posts]
-  end
-
-  subgraph preprocessingLayer [Preprocessing & Normalization]
-    langDetect[LangDetector]
-    normalizeText[Normalizer & Cleaner]
-    fluffFilter[FluffIrrelevantFilter]
-    claimExtractor[ClaimExtractor]
-    queueClaims[kafka_topic_claims]
-  end
-
-  subgraph factCheckLayer [Fact Retrieval & Verification]
-    retriever[HybridRetriever]
-    factDB[(FactDB + VectorStore)]
-    verifier[ClaimVerifier]
-    scorer[ConfidenceScorer]
-    queueResults[kafka_topic_results]
-  end
-
-  subgraph apiLayer [API & UI]
-    backendAPI[BackendAPI(FastAPI)]
-    reviewerUI[ReviewerDashboard]
-  end
-
-  socialAPIs --> queueIn
-  rssIngest --> queueIn
-  webScraper --> queueIn
-
-  queueIn --> langDetect --> normalizeText --> fluffFilter --> claimExtractor --> queueClaims
-  queueClaims --> retriever
-  retriever --> factDB
-  factDB --> retriever
-  retriever --> verifier --> scorer --> queueResults
-
-  queueResults --> backendAPI --> reviewerUI
+```text
+User
+  -> React frontend (Dashboard, SearchBar, ClaimCard)
+  -> FastAPI backend routes
+  -> Backend services
+  -> ML inference modules
+  -> Verified facts KB + SQL database
+  -> Verification result returned to frontend
 ```
 
+### 3.3 Layer Interaction
 
+| Layer | Responsibility | Interacts With |
+| --- | --- | --- |
+| Frontend | Accepts user query, sends verify request, renders result | FastAPI backend |
+| Backend API | Exposes routes, validates payloads, persists data, invokes ML services | Frontend, SQL database, ML layer |
+| ML layer | Cleans text, extracts claims, retrieves evidence, verifies claims | Backend, fact KB, local model artifacts |
+| Database | Stores posts, claims, and verdicts | Backend |
+| Verified fact base | Provides known facts for retrieval and verification | ML retrieval pipeline |
 
-### 1.1 Stages
+### 3.4 Data Flow
 
-- **Ingestion layer**
-  - Connectors to Twitter/X, Facebook, Instagram, YouTube comments, WhatsApp-like proxies (if any), and news sites (RSS, sitemaps, HTML scrapers).
-  - Write normalized `RawPost` records into `kafka_topic_raw_posts` (or similar message queue) with metadata (source, language hint, timestamp, geo, engagement, author).
-- **Preprocessing & claim extraction layer**
-  - **Language detection & transliteration**: detect language + script (e.g., Hindi in Devanagari vs Latin), transliterate to canonical script for some models.
-  - **Normalization & cleaning**: remove URLs, emojis (optional), HTML, excessive punctuation; normalize Unicode; standardize hashtags/usernames.
-  - **Fluff & irrelevant text filtering**: remove greetings, sign-offs, discourse markers, and non-claim chatter; score sentences for claim-likeness.
-  - **Claim segmentation & extraction**: split text into sentences/clauses; identify and extract check-worthy factual claims.
-  - **Output**: `Claim` records (claim text, language, source_post_id, entities, time, geo, topic) to `kafka_topic_claims`.
-- **Fact retrieval & verification layer**
-  - **Hybrid retrieval** from fact DB: BM25 + dense embeddings (vector search) + optional keyword filters.
-  - **Context construction**: build a context bundle of top-k candidate facts + evidence, normalized entities, and metadata (time, place).
-  - **Verification**: ML or rule-based labeler decides {Supported, Refuted, NotEnoughEvidence, NeedsReview} and assigns confidence.
-  - **Misinformation detection**: flag posts/claims that are refuted or unknown but potentially dangerous (e.g., health/election-related, viral).
-  - **Output**: `FactCheckResult` records to `kafka_topic_results` and persisted in DB.
-- **API & presentation layer**
-  - **Backend API (FastAPI)** to:
-    - Query fact-check results by post URL, ID, or text.
-    - Provide search UI for fact-checkers.
-    - Expose admin tools to manage fact DB.
-  - **Frontend dashboard** (React) for:
-    - Monitoring live stream of claims and statuses.
-    - Manual review/override of low-confidence cases.
-    - Annotation interface for building the verified fact database.
-- **Storage & infrastructure**
-  - **Operational store**: PostgreSQL (claims, posts, results, users, annotations, jobs).
-  - **Search**: Elasticsearch/OpenSearch for keyword + filters.
-  - **Vector store**: FAISS / Milvus for dense embeddings of claims/facts.
-  - **Object storage**: MinIO/S3 for raw HTML, screenshots, training data dumps.
-  - **Orchestration/Deployment**: Docker + Kubernetes (or docker-compose for student scope), Prometheus/Grafana for metrics.
+#### Ingestion to Display Flow
 
----
+1. A post can be created through the backend ingestion route.
+2. Claims are extracted from the stored post text.
+3. A claim is passed to the verification logic.
+4. The ML pipeline cleans the text and retrieves top candidate facts using multilingual embeddings.
+5. The verifier compares the claim against retrieved facts using multilingual NLI.
+6. The backend returns a verdict, confidence score, and source list.
+7. The frontend displays the claim card with verdict and evidence.
 
-## 2. Methods for high-throughput processing (thousands of posts/min)
+#### Direct Verify Flow
 
-- **Message queues for decoupling**
-  - **Kafka or Redpanda** topics per stage: `raw_posts`, `normalized_posts`, `claims`, `results`.
-  - Consumers scaled horizontally; partitions align with throughput needs.
-- **Horizontal scaling of stateless workers**
-  - Microservices or modular workers:
-    - `ingest-service`, `preprocess-service`, `claim-extractor-service`, `retriever-service`, `verifier-service`.
-  - Each runs multiple replicas behind a queue; scale out by running more replicas.
-- **Batch & micro-batch processing**
-  - Process messages in small batches (e.g., 16–128 posts) to exploit vectorization in NLP models (PyTorch batch inference).
-  - Group by language to reduce model switching overhead.
-- **Asynchronous I/O and concurrency**
-  - Use **async FastAPI** for APIs.
-  - Workers use async HTTP clients for external APIs, non-blocking DB drivers where possible.
-- **Caching**
-  - Redis cache for:
-    - Popular posts and their results.
-    - Recently computed embeddings of common text fragments (e.g., viral messages forwarded multiple times).
-    - Frequently used fact entries and retrieval results.
-- **Backpressure & prioritization**
-  - Kafka consumer groups with max poll interval + lag monitoring.
-  - Prioritize high-impact sources (e.g., verified political accounts, highly shared URLs) using priority queues or separate topics.
-- **Observability**
-  - Metrics: per-stage throughput, latency histograms, error rates, queue lag, GPU utilization.
-  - Logs: structured JSON logs for each worker; correlation IDs for tracing per post/claim.
+1. User enters a claim in the frontend search bar.
+2. Frontend sends `POST /verify` with raw text.
+3. Backend calls `verify_claim_logic`.
+4. ML pipeline runs fluff filtering, retrieval, and NLI verification.
+5. JSON response is returned and rendered in the dashboard.
 
----
+## 4. Backend Details
 
-## 3. Techniques to maintain context accuracy in the fact database
+### 4.1 Frameworks and Core Backend Stack
 
-- **Fact schema design**
-  - `Fact` entity fields:
-    - `id`, `canonical_claim_text`, `language`, `translations`.
-    - `entities` (linked to entity store), `time_validity` (from/to), `geo_scope` (country/state/city).
-    - `source` (fact-checking org, article URL, evidence URLs), `verdict` (True/False/Misleading/etc.).
-    - `topic_tags` (health, politics, crime, finance, religion, etc.).
-- **Entity-centric modeling**
-  - Separate `Entity` table (persons, orgs, places, events) with aliases across languages and scripts.
-  - Use NER + entity linker to map claims to entities; retrieval is then entity-aware.
-- **Time & geography-aware retrieval**
-  - Include time and geo filters in retrieval queries.
-  - Example: claim about “fuel price now” should prioritize recent facts from the same country/state.
-- **Hybrid retrieval for context accuracy**
-  - **BM25 (Elasticsearch)** on normalized text, plus filters on language, topic, time.
-  - **Dense retrieval (FAISS/Milvus)** using multilingual encoders (e.g., XLM-R, IndicBERT) for semantic similarity across languages.
-  - **Re-ranking** with cross-encoder models that take `[claim, fact]` pairs and output relevance scores.
-- **Normalization & canonicalization pipeline for new facts**
-  - When ingesting new verified facts:
-    - Normalize text (same preprocessing as incoming claims).
-    - Extract entities, time, location, topics.
-    - Generate embeddings for canonical claim and translations.
-    - Store full provenance (links to sources, authors, publication date).
-- **Human-in-the-loop review**
-  - UI to approve/edit canonical claims, correct entities, and mark duplicates.
-  - Periodic deduplication job to merge semantically identical facts across languages.
-- **Versioning & auditability**
-  - Maintain version history for each fact.
-  - Store which model version produced which verdict for reproducibility.
+The backend uses:
 
----
+- FastAPI for route handling and OpenAPI generation.
+- SQLModel for schema definition and DB interaction.
+- SQLAlchemy engine through SQLModel.
+- Pydantic Settings for environment-driven configuration.
+- Uvicorn for application serving.
 
-## 4. NLP methods to remove conversational fluff and irrelevant text
+Core backend entrypoint: [backend/app/main.py](project-integration/vernacular-fact-checker/backend/app/main.py)
 
-- **Rule-based preprocessing**
-  - Regex and heuristics to strip:
-    - Greetings ("good morning", "namaste", "salaam", equivalents in Indian languages).
-    - Courtesy phrases ("please share", "forward this", "subscribe", "like/comment/share").
-    - User mentions, hashtags (optionally keep content words from hashtags), emojis, excessive punctuation.
-- **Sentence segmentation and classification**
-  - Split text into sentences/clauses using language-specific sentence boundary detection (Indic NLP library, spaCy models, or rule-based for resource-poor languages).
-  - Train a **binary classifier** (claim vs non-claim) on sentences:
-    - Models: small transformers (e.g., `xlm-roberta-base`, `indic-bert`) fine-tuned for claim detection.
-    - Negative examples: jokes, opinions, questions without factual assertions, chit-chat.
-- **Claim-worthiness scoring**
-  - Multi-class classifier to rank sentences by check-worthiness (e.g., elections, public health, communal issues).
-  - Use thresholds to drop low-scoring sentences.
-- **Dependency & POS-based heuristics**
-  - Use syntactic patterns to ensure factual assertions (presence of verbs, entities, numbers, dates).
-  - Filter out isolated nouns or fragments (e.g., just a URL or hashtag cloud).
-- **Summarization for long posts**
-  - For long rants or threads, use extractive summarization based on claim-worthiness scores to reduce to a few key factual sentences before retrieval.
-- **Template & keyword filters**
-  - Maintain lists of generic phrases (e.g., "like and share", "I think", "in my opinion") in multiple languages to downweight/remove those segments.
+### 4.2 Backend Configuration
 
----
+Configuration is defined in [backend/app/core/config.py](project-integration/vernacular-fact-checker/backend/app/core/config.py).
 
-## 5. Strategies for multilingual processing for Indian languages
+| Setting | Required | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | Yes | SQLModel database connection string |
+| `REDIS_URL` | No | Reserved for future cache integration |
+| `KAFKA_BOOTSTRAP_SERVERS` | No | Reserved for future stream integration |
 
-- **Language & script detection**
-  - Use fast language ID (fastText langid models) trained/fine-tuned for Indian languages.
-  - Detect script (Devanagari, Latin, Bengali, Gurmukhi, etc.) via Unicode ranges.
-- **Transliteration & normalization**
-  - For code-mixed and Romanized Indian languages, use transliteration libraries or sequence models to map to native scripts (e.g., Hindi Latin → Devanagari).
-  - Normalize spacing, digits (Devanagari numerals → ASCII), dates, and currency formats.
-- **Shared multilingual encoders**
-  - Use models like **IndicBERT, MuRIL, XLM-R** so that semantically similar claims in different languages are mapped to nearby vector space locations.
-  - Fine-tune for retrieval and classification tasks (claim detection, stance classification) with multilingual datasets.
-- **Language-specific components where needed**
-  - Per-language stopword lists, punctuation rules, and slang dictionaries.
-  - Optional per-language light stemmers or lemmatizers.
-- **Code-mixing handling**
-  - Identify mixed-language stretches at the token level; route to models fine-tuned on code-mixed data.
-  - Use token-level language tags to help models disambiguate.
-- **Multilingual fact DB**
-  - Store canonical fact in primary language plus translations.
-  - For retrieval, search across all languages using embeddings; but apply language preferences (e.g., prefer same-language evidence first, then cross-lingual).
-- **Evaluation per language**
-  - Track precision/recall by language and key dialect groups to avoid underperformance on low-resource languages.
+### 4.3 Database Models
 
----
+#### Post
 
-## 6. Recommended tools, frameworks, and ML models
+Defined in [backend/app/models/post.py](project-integration/vernacular-fact-checker/backend/app/models/post.py)
 
-- **Programming & frameworks**
-  - **Python 3.11+** as main language.
-  - **FastAPI** for backend APIs.
-  - **Kafka/Redpanda** for streaming; alternatively **RabbitMQ** for smaller-scale student deployments.
-  - **Celery + Redis** or **Kafka consumer workers** for background processing.
-  - **PostgreSQL** for relational data.
-  - **Elasticsearch/OpenSearch** for full-text + BM25 retrieval.
-  - **FAISS or Milvus** for vector similarity search.
-- **NLP & ML**
-  - **PyTorch** / **HuggingFace Transformers** for model training/inference.
-  - **spaCy** for tokenization, NER (where models exist), custom pipelines; integrate with Indic NLP tools.
-  - **Indic NLP Library** and similar projects for tokenization, transliteration, and script handling for Indian languages.
-- **Candidate models** (for student-friendly setup)
-  - Language-agnostic sentence embeddings: `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`.
-  - Indic-focused: `ai4bharat/indic-bert`, `google/muril-base-cased`, `xlm-roberta-base` fine-tuned.
-  - Claim detection / stance classification: fine-tune above encoders on claim datasets (e.g., FakeNewsNet, ClaimBuster-like sources, Indian fact-check corpora where available).
-- **Frontend**
-  - **React + TypeScript** with **Vite** or **Next.js**.
-  - UI: **Tailwind CSS** or **Material UI**.
-  - Charts/metrics: **Recharts**, **Chart.js**, or **ECharts**.
-- **DevOps & tooling**
-  - **Docker** for containerization; **docker-compose** for local.
-  - **GitHub Actions** or **GitLab CI** for CI/CD.
-  - **Poetry** or **pip + requirements.txt** for Python deps.
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | int | Primary key |
+| `source` | str | Source platform or origin label |
+| `text` | str | Raw post content |
+| `language` | str or null | Language tag |
+| `author` | str or null | Optional author |
+| `url` | str or null | Optional source URL |
+| `created_at` | datetime | Timestamp |
 
----
+#### Claim
 
-## 7. Example project folder structure
+Defined in [backend/app/models/claim.py](project-integration/vernacular-fact-checker/backend/app/models/claim.py)
 
-- **Root**
-  - `backend/`
-    - `app/`
-      - `main.py` (FastAPI entrypoint)
-      - `api/`
-        - `routes_posts.py`
-        - `routes_claims.py`
-        - `routes_facts.py`
-        - `routes_admin.py`
-      - `core/`
-        - `config.py`
-        - `logging.py`
-      - `models/`
-        - `post.py`
-        - `claim.py`
-        - `fact.py`
-        - `fact_check_result.py`
-        - `user.py`
-      - `db/`
-        - `session.py`
-        - `schemas.sql` or Alembic migrations
-      - `services/`
-        - `ingest_service.py`
-        - `preprocess_service.py`
-        - `claim_extractor_service.py`
-        - `retrieval_service.py`
-        - `verification_service.py`
-        - `cache_service.py`
-      - `workers/`
-        - `kafka_consumer_claims.py`
-        - `kafka_consumer_results.py`
-      - `tests/`
-    - `Dockerfile`
-    - `requirements.txt`
-  - `ml/`
-    - `notebooks/`
-    - `data/` (small samples; big data in external storage)
-    - `models/`
-      - `claim_detector/`
-      - `stance_classifier/`
-      - `retriever_encoder/`
-    - `training/`
-      - `train_claim_detector.py`
-      - `train_stance_classifier.py`
-    - `inference/`
-      - `claim_detector.py`
-      - `fluff_filter.py`
-      - `embedder.py`
-      - `retrieval_pipeline.py`
-  - `frontend/`
-    - `src/`
-      - `App.tsx`
-      - `components/`
-        - `LiveFeed.tsx`
-        - `ClaimCard.tsx`
-        - `FactCheckDetail.tsx`
-        - `FiltersPanel.tsx`
-        - `AnnotationForm.tsx`
-      - `pages/`
-        - `Dashboard.tsx`
-        - `ClaimReview.tsx`
-        - `FactDatabase.tsx`
-      - `services/`
-        - `api.ts` (REST client)
-    - `public/`
-    - `package.json`
-  - `infra/`
-    - `docker-compose.yml`
-    - `k8s/` (optional manifests)
-  - `docs/`
-    - `architecture.md`
-    - `api-spec.md`
-    - `ml-design.md`
-  - `README.md`
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | int | Primary key |
+| `post_id` | int | Source post identifier |
+| `claim_text` | str | Extracted claim text |
+| `language` | str or null | Language inherited from post |
+| `created_at` | datetime | Timestamp |
 
----
+#### Verdict
 
-## 8. Team structure and work division
+Defined in [backend/app/models/verdict.py](project-integration/vernacular-fact-checker/backend/app/models/verdict.py)
 
-### 8.1 Member A – Backend Engineer
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | int | Primary key |
+| `claim_id` | int | Linked claim |
+| `verdict` | str | Verification result |
+| `confidence` | float | Confidence score |
+| `evidence` | str | JSON-serialized source evidence |
+| `created_at` | datetime | Timestamp |
 
-- **Responsibilities**
-  - Design and implement the backend services, REST APIs, and message-driven workers.
-  - Integrate with Kafka/Redis, PostgreSQL, Elasticsearch, FAISS/Milvus (through ML engineer’s modules).
-  - Implement authentication/authorization for internal dashboard.
-  - Expose endpoints for ingestion, fact-check results, fact DB management, and annotations.
-  - Implement monitoring, logging, and basic rate limiting.
-- **Key technologies**
-  - Python, FastAPI, Pydantic.
-  - Kafka (or Redis Streams/RabbitMQ for simpler setup).
-  - PostgreSQL, SQLAlchemy/SQLModel.
-  - Elasticsearch/OpenSearch client.
-  - Redis for caching.
-  - Docker, docker-compose.
-- **Step-by-step tasks**
-  1. **Core backend scaffold**
-    - Initialize `backend/` FastAPI project with environment-based config.
-    - Set up DB connection (PostgreSQL) and ORM models for posts, claims, facts, results, users.
-  2. **API design & implementation**
-    - Implement `GET /health`, `GET /stats` for monitoring.
-    - Implement APIs:
-      - `POST /ingest/post` (for testing/manual input).
-      - `GET /posts/{id}` and `GET /claims/{id}`.
-      - `GET /fact-check` with query by text or URL.
-      - Admin endpoints for CRUD on facts and users.
-  3. **Messaging and workers**
-    - Implement Kafka consumer/producer wrappers.
-    - Build workers to:
-      - Read from `raw_posts` and call ML preprocessing/claim extraction (via ML modules).
-      - Read claims from `claims` and call retrieval/verification ML modules.
-      - Save results to DB and publish to `results` topic.
-  4. **Caching and performance**
-    - Integrate Redis caching for hot results and metadata.
-    - Add simple request-level caching for the most common queries.
-  5. **Security & auth**
-    - Implement JWT-based auth for internal dashboard APIs.
-  6. **Monitoring & logging**
-    - Add structured logging middleware.
-    - Add Prometheus metrics endpoints if time allows.
-- **Files/modules Member A will create**
-  - `backend/app/main.py`
-  - `backend/app/core/config.py`, `logging.py`
-  - `backend/app/models/{post,claim,fact,fact_check_result,user}.py`
-  - `backend/app/api/{routes_posts,routes_claims,routes_facts,routes_admin}.py`
-  - `backend/app/services/{ingest_service,preprocess_service,claim_extractor_service,retrieval_service,verification_service,cache_service}.py`
-  - `backend/app/workers/{kafka_consumer_claims,kafka_consumer_results}.py`
-  - `backend/requirements.txt`
-- **Expected outputs**
-  - Running backend service exposing REST APIs and Kafka workers.
-  - Database schema for posts/claims/facts/results.
-  - Internal documentation in `docs/api-spec.md` describing endpoints.
-- **Integration with others**
-  - Consumes ML modules from Member C as Python packages/modules (`ml/inference/`*).
-  - Provides HTTP APIs for Member B’s frontend and annotation UI.
-  - Exposes admin endpoints to let Member C update fact DB and trigger re-indexing.
+### 4.4 API Routes
 
----
+#### Core Utility Routes
 
-### 8.2 Member B – Frontend Engineer
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/` | Root status message |
+| `GET` | `/health` | Health check |
 
-- **Responsibilities**
-  - Build the web dashboard for monitoring streams, reviewing claims, and managing facts.
-  - Implement UI components for browsing posts, viewing fact-check results, and annotating new facts.
-  - Provide clear UX for multilingual content and filtering.
-  - Integrate with backend APIs for live updates (polling or websockets if added later).
-- **Key technologies**
-  - React + TypeScript.
-  - Tailwind CSS or Material UI.
-  - Axios or Fetch for API calls.
-  - Vite/Next.js for build/dev environment.
-- **Step-by-step tasks**
-  1. **Project setup**
-    - Initialize React + TypeScript project in `frontend/`.
-    - Configure routing (e.g., React Router).
-  2. **Design system & layout**
-    - Create core layout: navbar, sidebar, main content area.
-    - Define color palette and typography suitable for data-heavy dashboards.
-  3. **Dashboard views**
-    - `Dashboard` page:
-      - Live table/stream of latest claims with status, language, source.
-      - Filters by language, verdict, confidence, topic.
-    - `ClaimReview` page:
-      - Detail view showing original post text, extracted claims, evidence facts, model verdict, and confidence.
-      - Controls to approve/override, assign labels for training data.
-    - `FactDatabase` page:
-      - Search and browse verified facts.
-      - Form to add/edit facts (including language, entities, time/geo scope).
-  4. **API integration**
-    - Implement `frontend/src/services/api.ts` to talk to backend endpoints (Member A).
-    - Map responses to TypeScript types.
-  5. **User auth UI**
-    - Basic login form, token storage, and logout.
-  6. **UX enhancements & validation**
-    - Loading states, error handling, pagination.
-    - Indicate model confidence visually (e.g., colored badges).
-- **Files/modules Member B will create**
-  - `frontend/src/App.tsx`
-  - `frontend/src/pages/{Dashboard,ClaimReview,FactDatabase}.tsx`
-  - `frontend/src/components/{LiveFeed,ClaimCard,FactCheckDetail,FiltersPanel,AnnotationForm,Navbar,Sidebar}.tsx`
-  - `frontend/src/services/api.ts`
-  - `frontend/package.json`, config files.
-- **Expected outputs**
-  - Working single-page dashboard that interacts with backend APIs.
-  - Annotation interface for fact-checkers to label claims and add facts.
-  - Basic styling and responsive layout.
-- **Integration with others**
-  - Uses backend REST APIs from Member A for data.
-  - Sends annotation data (labeled claims, new facts) that Member C can use to improve models.
-  - Displays language, confidence, and model outputs provided by Member C’s modules via backend.
+#### Post and Claim Routes
 
----
+| Method | Path | File | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/ingest/post` | [backend/app/api/routes_posts.py](project-integration/vernacular-fact-checker/backend/app/api/routes_posts.py) | Persist a post to the database |
+| `POST` | `/extract/claims/{post_id}` | [backend/app/api/routes_claims.py](project-integration/vernacular-fact-checker/backend/app/api/routes_claims.py) | Split a stored post into claim records |
 
-### 8.3 Member C – ML/Data Engineer
+#### Verification Routes
 
-- **Responsibilities**
-  - Design and implement all NLP/ML components: preprocessing, language detection, fluff removal, claim extraction, retrieval, and verification.
-  - Build and maintain the fact database’s indexing (text + vector) pipelines.
-  - Prepare datasets, train/fine-tune models, and ship inference modules consumable by backend.
-- **Key technologies**
-  - Python, Jupyter notebooks.
-  - PyTorch, HuggingFace Transformers.
-  - spaCy, Indic NLP Library.
-  - FAISS or Milvus for vector search.
-  - Pandas, scikit-learn for data prep and basic baselines.
-- **Step-by-step tasks**
-  1. **Data collection & preprocessing**
-    - Collect sample datasets from public Indian fact-checking sites and open datasets.
-    - Build scripts to parse, clean, and normalize text (multi-language support).
-  2. **Language/script detection module**
-    - Train/finetune or adopt existing lang ID model for Indic languages.
-    - Implement `detect_language(text)` and `detect_script(text)` functions.
-  3. **Fluff filtering & claim detection**
-    - Implement heuristic cleaner (remove URLs, emojis, boilerplate phrases in multiple languages).
-    - Create labeled dataset for claim vs non-claim at sentence level.
-    - Fine-tune a small multilingual transformer as claim detector; export inference code.
-  4. **Claim extraction pipeline**
-    - Combine sentence splitter + claim detector to output structured `Claim` objects.
-  5. **Retrieval pipeline**
-    - Choose embedding model (e.g., XLM-R or IndicBERT-based sentence transformer).
-    - Build scripts to index verified facts into FAISS/Milvus + Elasticsearch.
-    - Implement hybrid retrieval: BM25 + vector similarity + re-ranking.
-  6. **Verification / stance classification**
-    - Train model to classify [claim, fact] pairs as Supported / Refuted / NotEnoughEvidence.
-    - Implement scoring and threshold tuning.
-  7. **Packaging & integration**
-    - Wrap all inference code into lightweight modules callable from backend:
-      - `ml/inference/claim_detector.py`
-      - `ml/inference/fluff_filter.py`
-      - `ml/inference/embedder.py`
-      - `ml/inference/retrieval_pipeline.py`
-      - `ml/inference/verifier.py`
-    - Provide clear function signatures and configuration options.
-  8. **Evaluation & monitoring**
-    - Define evaluation metrics per language (precision/recall/F1 for claim detection, retrieval quality, stance classification).
-    - Provide evaluation scripts and reports.
-- **Files/modules Member C will create**
-  - `ml/notebooks/*.ipynb` for experiments.
-  - `ml/data_preparation/*.py` for scraping and preprocessing.
-  - `ml/training/{train_claim_detector.py,train_stance_classifier.py}`.
-  - `ml/inference/{claim_detector.py,fluff_filter.py,embedder.py,retrieval_pipeline.py,verifier.py}`.
-  - `ml/models/` storing checkpoints (small for repo, larger in external storage).
-  - `docs/ml-design.md` documenting model choices and pipelines.
-- **Expected outputs**
-  - Trained or fine-tuned models (or configured open models) for:
-    - Language detection (or integrated third-party model).
-    - Claim detection and claim-worthiness.
-    - Retrieval embeddings and hybrid retrieval.
-    - Stance classification / verification.
-  - Reusable Python modules for inference, ready to be imported by backend services.
-- **Integration with others**
-  - Provides Python inference APIs and config files to Member A for integration in workers.
-  - Supplies evaluation metrics and guidelines so Member B can surface model performance in the UI.
-  - Consumes annotation data (labels, new facts) from frontend/ backend to retrain/refine models.
+| Method | Path | File | Purpose |
+| --- | --- | --- | --- |
+| `POST` | `/verify` | [backend/app/api/routes_verification.py](project-integration/vernacular-fact-checker/backend/app/api/routes_verification.py) | Verify raw text without DB writes |
+| `POST` | `/verify/claim/{claim_id}` | [backend/app/api/routes_verification.py](project-integration/vernacular-fact-checker/backend/app/api/routes_verification.py) | Verify a stored claim and persist the verdict |
 
----
+Note: there is no generic `/ingest` route in the current implementation. The active route is `/ingest/post`.
 
-## 9. Suggested initial milestones (for the team)
+### 4.5 Backend Services and Responsibilities
 
-- **Milestone 1 – Skeleton system (Week 1–2)**
-  - Backend: health APIs, DB schema, minimal ingest + result endpoints.
-  - Frontend: static dashboard mock with dummy data.
-  - ML: basic preprocessing, off-the-shelf multilingual embeddings, trivial keyword-based retrieval.
-- **Milestone 2 – End-to-end MVP (Week 3–4)**
-  - Claim extraction and simple verification in one or two languages (e.g., Hindi + English).
-  - Kafka-based pipeline wired up with at least one ingestion source.
-  - Dashboard shows live claims and verdicts.
-- **Milestone 3 – Multilingual & optimization (Week 5–6)**
-  - Add more Indian languages and better claim detection.
-  - Implement fluff removal, hybrid retrieval, and time/geo-aware filters.
-  - Improve UI for annotation and incorporate feedback loop into ML training.
+#### Verification Service
 
+File: [backend/app/services/verification_service.py](project-integration/vernacular-fact-checker/backend/app/services/verification_service.py)
+
+Responsibilities:
+
+- Lazily loads ML functions with `lru_cache`.
+- Cleans and normalizes claim text.
+- Retrieves candidate facts from the fact knowledge base.
+- Calls the ML verifier.
+- Normalizes source payloads for backend responses.
+- Raises structured service-level errors when ML loading or inference fails.
+
+#### Ingest Service
+
+File: [backend/app/services/ingest_service.py](project-integration/vernacular-fact-checker/backend/app/services/ingest_service.py)
+
+Responsibilities:
+
+- Cleans post text.
+- Calls the ML claim detector.
+- Stores extracted claims in the SQL database.
+
+Current status:
+
+- This service exists and is more ML-aware than the simple route implementation.
+- The current `/extract/claims/{post_id}` route still uses a direct sentence split on periods instead of calling this service.
+
+#### Similarity Service
+
+File: [backend/app/services/similarity_service.py](project-integration/vernacular-fact-checker/backend/app/services/similarity_service.py)
+
+Responsibilities:
+
+- Generates embeddings for a single text.
+- Computes cosine similarity between claim and evidence text.
+
+Current status:
+
+- The service is available as a utility module.
+- It is not currently exposed through an API route.
+
+## 5. ML Details
+
+### 5.1 ML Pipeline Overview
+
+The ML layer is divided into:
+
+- `ml/inference` for runtime prediction.
+- `ml/pipeline` for supporting pipeline utilities.
+- `ml/training` for model training scripts.
+- `ml/tests` for pipeline tests.
+- `ml/data` for the verified fact base, sample posts, and test fixtures.
+
+### 5.2 Runtime Verification Pipeline
+
+The active inference path is centered around:
+
+- [ml/inference/fluff_filter.py](project-integration/vernacular-fact-checker/ml/inference/fluff_filter.py)
+- [ml/inference/claim_detector.py](project-integration/vernacular-fact-checker/ml/inference/claim_detector.py)
+- [ml/inference/embedder.py](project-integration/vernacular-fact-checker/ml/inference/embedder.py)
+- [ml/inference/retrieval_pipeline.py](project-integration/vernacular-fact-checker/ml/inference/retrieval_pipeline.py)
+- [ml/inference/verifier.py](project-integration/vernacular-fact-checker/ml/inference/verifier.py)
+- [ml/inference/pipeline.py](project-integration/vernacular-fact-checker/ml/inference/pipeline.py)
+
+#### Step 1: Fluff Filtering and Normalization
+
+`clean_text` removes:
+
+- URLs
+- social mentions
+- hashtags
+- emojis
+- repeated punctuation
+- viral-forwarding patterns such as `please share`, `like and share`, and Hindi equivalents
+
+This is implemented in [ml/inference/fluff_filter.py](project-integration/vernacular-fact-checker/ml/inference/fluff_filter.py).
+
+Important implementation note:
+
+- Fluff is removed case-insensitively without lowercasing the full string, which preserves model-sensitive casing behavior for the verifier.
+
+#### Step 2: Claim Detection
+
+`extract_claims` works in two modes:
+
+- Preferred mode: load a trained TF-IDF + Logistic Regression classifier from disk if artifacts exist.
+- Fallback mode: use heuristic sentence filtering based on length, numbers, and verb hints in English and Hindi.
+
+Implemented in [ml/inference/claim_detector.py](project-integration/vernacular-fact-checker/ml/inference/claim_detector.py).
+
+#### Step 3: Cross-Lingual Retrieval
+
+The retrieval pipeline:
+
+- Loads fact records from [ml/data/verified_facts.jsonl](project-integration/vernacular-fact-checker/ml/data/verified_facts.jsonl).
+- Embeds fact statements with LaBSE.
+- Caches fact embeddings to disk in `ml/cache/retrieval`.
+- Uses cosine similarity to rank top-k matching facts.
+- Applies language-aware similarity thresholds and fallbacks.
+
+Implemented in [ml/inference/retrieval_pipeline.py](project-integration/vernacular-fact-checker/ml/inference/retrieval_pipeline.py).
+
+Current fact base size:
+
+- 392 fact records in `verified_facts.jsonl`
+
+#### Step 4: Verification via Multilingual NLI
+
+The verifier:
+
+- Builds premise-hypothesis pairs from retrieved facts and the cleaned claim.
+- Tokenizes both premise and hypothesis in lowercase.
+- Runs multilingual NLI classification.
+- Chooses `Supported`, `Refuted`, or `NotEnoughEvidence` using both NLI probabilities and retrieval thresholds.
+
+Implemented in [ml/inference/verifier.py](project-integration/vernacular-fact-checker/ml/inference/verifier.py).
+
+### 5.3 Models Used
+
+Configured in [ml/config.py](project-integration/vernacular-fact-checker/ml/config.py).
+
+| Component | Model | Purpose |
+| --- | --- | --- |
+| Embeddings | `sentence-transformers/LaBSE` | Cross-lingual sentence embeddings for retrieval |
+| Verifier | `joeddav/xlm-roberta-large-xnli` | Multilingual natural language inference |
+| Claim detector | Local TF-IDF + Logistic Regression artifacts when trained | Sentence-level claim classification |
+
+### 5.4 ML Thresholds and Runtime Configuration
+
+Current verification-related thresholds:
+
+| Setting | Value | Purpose |
+| --- | --- | --- |
+| `TOP_K_FACTS` | `5` | Number of retrieved facts |
+| `MIN_SIMILARITY` | `0.40` | Base English retrieval threshold |
+| `MIN_SIMILARITY_HI` | `0.35` | Hindi retrieval threshold |
+| `MIN_SIMILARITY_FALLBACK` | `0.20` | Low-confidence fallback threshold |
+| `NLI_DECISION_THRESHOLD` | `0.45` | Strong entailment/contradiction threshold |
+| `NLI_WEAK_SIGNAL_THRESHOLD` | `0.38` | Weak but acceptable NLI threshold |
+| `RETRIEVAL_SUPPORT_THRESHOLD` | `0.50` | Retrieval support required for verdict |
+| `RETRIEVAL_STRONG_THRESHOLD` | `0.60` | Strong retrieval threshold for weak NLI signals |
+
+### 5.5 Training Datasets and Methodology
+
+#### Claim Detector Training
+
+Implemented in [ml/training/train_claim_detector.py](project-integration/vernacular-fact-checker/ml/training/train_claim_detector.py).
+
+Methodology:
+
+- Input can be CSV or JSONL.
+- Supports flexible text columns such as `text`, `claim_text`, or `sentence`.
+- Supports label columns `label` or `is_claim`.
+- Uses `TfidfVectorizer` with unigram and bigram features.
+- Trains a `LogisticRegression` classifier with balanced class weights.
+- Saves model and vectorizer using `joblib`.
+
+Auto-generation option:
+
+- The script can generate positive claim examples from the verified fact base.
+- It creates negative non-claim examples from social or conversational templates.
+
+#### Verifier Training
+
+Implemented in [ml/training/train_verifier.py](project-integration/vernacular-fact-checker/ml/training/train_verifier.py).
+
+Methodology:
+
+- Accepts labelled premise-hypothesis data.
+- Maps labels into three NLI classes: contradiction, neutral, and entailment.
+- Fine-tunes `joeddav/xlm-roberta-large-xnli` for three-way classification.
+- Saves tokenizer and model artifacts to the configured verifier model directory.
+
+Auto-generation option:
+
+- Builds entailment pairs from same-topic bilingual facts using `topic_id`.
+- Builds neutral pairs from random cross-topic facts.
+- Builds contradiction proxies by negating unrelated claims.
+
+### 5.6 Cross-Lingual Support
+
+Cross-lingual support is a core feature of the system.
+
+How it works:
+
+- LaBSE maps semantically equivalent English and Hindi claims into nearby embedding vectors.
+- The verified fact base contains bilingual records sharing a common `topic_id`.
+- A Hindi user claim can retrieve English facts and vice versa.
+- The NLI verifier is multilingual and can score claim-fact alignment without a translation stage.
+
+Example:
+
+- English fact: `The Earth is the third planet from the Sun.`
+- Hindi fact: `पृथ्वी सूर्य से तीसरा ग्रह है।`
+- Both can support the same claim because retrieval is embedding-based rather than exact-string-only.
+
+### 5.7 ML Tests and Evaluation Assets
+
+Repository testing assets include:
+
+- [ml/tests/test_pipeline.py](project-integration/vernacular-fact-checker/ml/tests/test_pipeline.py)
+- [ml/tests/test_retrieval.py](project-integration/vernacular-fact-checker/ml/tests/test_retrieval.py)
+- [ml/tests/test_text_cleaning.py](project-integration/vernacular-fact-checker/ml/tests/test_text_cleaning.py)
+- [ml/tests/test_language_id.py](project-integration/vernacular-fact-checker/ml/tests/test_language_id.py)
+- [ml/data/_smoke_test.py](project-integration/vernacular-fact-checker/ml/data/_smoke_test.py)
+- [ml/data/test_all_samples.py](project-integration/vernacular-fact-checker/ml/data/test_all_samples.py)
+- [ml/data/verify_test_samples.jsonl](project-integration/vernacular-fact-checker/ml/data/verify_test_samples.jsonl)
+
+Current sample test asset size:
+
+- 25 bilingual verification samples
+
+## 6. Frontend Details
+
+### 6.1 Frontend Stack
+
+The frontend uses:
+
+- React
+- TypeScript
+- Vite
+- CSS-based styling with Tailwind-related tooling available in the dependency graph
+
+Main files:
+
+- [frontend/factcheck-frontend/src/main.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/main.tsx)
+- [frontend/factcheck-frontend/src/pages/Dashboard.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/pages/Dashboard.tsx)
+- [frontend/factcheck-frontend/src/components/SearchBar.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/components/SearchBar.tsx)
+- [frontend/factcheck-frontend/src/components/ClaimCard.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/components/ClaimCard.tsx)
+- [frontend/factcheck-frontend/src/components/Header.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/components/Header.tsx)
+
+### 6.2 Component Responsibilities
+
+| Component | File | Responsibility |
+| --- | --- | --- |
+| `Dashboard` | [frontend/factcheck-frontend/src/pages/Dashboard.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/pages/Dashboard.tsx) | Holds verification result state, loading state, and error state |
+| `SearchBar` | [frontend/factcheck-frontend/src/components/SearchBar.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/components/SearchBar.tsx) | Accepts user input and triggers verification requests |
+| `ClaimCard` | [frontend/factcheck-frontend/src/components/ClaimCard.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/components/ClaimCard.tsx) | Displays claim text, verdict, confidence, and sources |
+| `Header` | [frontend/factcheck-frontend/src/components/Header.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/components/Header.tsx) | Renders the page header |
+
+### 6.3 Frontend to Backend Interaction
+
+The frontend calls the backend by sending a `POST /verify` request with a JSON payload of the form:
+
+```json
+{
+  "text": "The Earth is the third planet from the Sun."
+}
+```
+
+This request is sent from [frontend/factcheck-frontend/src/components/SearchBar.tsx](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/src/components/SearchBar.tsx).
+
+### 6.4 Vite Proxy Configuration
+
+Defined in [frontend/factcheck-frontend/vite.config.ts](project-integration/vernacular-fact-checker/frontend/factcheck-frontend/vite.config.ts).
+
+Current proxy behavior:
+
+- Requests to `/verify` are proxied to `http://127.0.0.1:8000`
+
+This keeps the frontend code simple during local development.
+
+### 6.5 UI Runtime Behavior
+
+Current UI behavior includes:
+
+- Loading state while verification is in progress.
+- Error display if backend verification fails.
+- A client-side timeout for long verification requests so the UI does not stay indefinitely in a loading state.
+
+## 7. Deployment and Run Instructions
+
+### 7.1 Repository Setup
+
+From the repository root:
+
+```powershell
+cd project-integration/vernacular-fact-checker
+```
+
+### 7.2 Python Environment Setup
+
+Example local setup:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r backend/requirements.txt
+pip install -r ml/requirements-ml.txt
+```
+
+Note:
+
+- The current workspace has been running with an already existing Python virtual environment.
+- Any equivalent activated Python environment works as long as the backend and ML requirements are installed.
+
+### 7.3 Backend Run Instructions
+
+Set the required database environment variable and run Uvicorn from the backend directory.
+
+#### Local SQLite Example
+
+```powershell
+cd backend
+$env:DATABASE_URL = "sqlite:///./app.db"
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+Useful backend URLs:
+
+- `http://127.0.0.1:8000/`
+- `http://127.0.0.1:8000/health`
+- `http://127.0.0.1:8000/docs`
+
+Important notes:
+
+- `DATABASE_URL` is required.
+- On first verification request, model loading can take longer because Hugging Face artifacts may be loaded into cache.
+- The backend inserts the repository root into `sys.path` so the `ml` package is importable from the backend app.
+
+### 7.4 Frontend Run Instructions
+
+From the frontend directory:
+
+```powershell
+cd frontend/factcheck-frontend
+npm install
+npm run dev -- --host 127.0.0.1 --port 5173
+```
+
+Frontend URL:
+
+- `http://127.0.0.1:5173`
+
+### 7.5 Connecting Frontend to Backend
+
+The local development setup assumes:
+
+- Frontend on `127.0.0.1:5173`
+- Backend on `127.0.0.1:8000`
+
+The Vite proxy forwards `/verify` automatically. If additional backend routes are added to the frontend later, the proxy configuration should be extended accordingly.
+
+## 8. Sample Input and Output
+
+### 8.1 Example Inputs
+
+Examples are drawn from [ml/data/verify_test_samples.jsonl](project-integration/vernacular-fact-checker/ml/data/verify_test_samples.jsonl).
+
+| Language | Example Input | Expected Verdict |
+| --- | --- | --- |
+| English | `🔥 Like and share! The Earth is the third planet from the Sun. #science` | Supported |
+| Hindi | `🌍 पृथ्वी सूर्य से तीसरा ग्रह है। #science` | Supported |
+| English misinformation | `5G towers are the real cause of COVID-19. Scientists have confirmed this. Please share this vital information with your family!` | Refuted |
+| Hindi misinformation | `खुशखबरी! 500 और 1000 के पुराने नोट जनवरी 2024 से वापस चालू कर दिए गए हैं। RBI ने इसकी पुष्टि की है। 😍😍 ज़्यादा से ज़्यादा शेयर करें!` | Refuted |
+| Speculative claim | `The government is planning to launch a new free electricity scheme for all rural households by December 2026.` | NotEnoughEvidence |
+
+### 8.2 Example Verification Response
+
+Representative response shape for `POST /verify`:
+
+```json
+{
+  "claim": "The Earth is the third planet from the Sun.",
+  "verdict": "Supported",
+  "confidence": 0.9995,
+  "sources": [
+    {
+      "id": "fact6",
+      "claim": "The Earth is the third planet from the Sun.",
+      "language": "en",
+      "score": 1.0
+    },
+    {
+      "id": "fact7",
+      "claim": "पृथ्वी सूर्य से तीसरा ग्रह है।",
+      "language": "hi",
+      "score": 0.9163
+    }
+  ]
+}
+```
+
+### 8.3 Example Route Usage
+
+#### Verify Raw Text
+
+```http
+POST /verify
+Content-Type: application/json
+
+{
+  "text": "The Earth is the third planet from the Sun."
+}
+```
+
+#### Ingest a Post
+
+```http
+POST /ingest/post
+Content-Type: application/json
+
+{
+  "source": "whatsapp",
+  "text": "भारत को 15 अगस्त 1947 को स्वतंत्रता मिली।",
+  "language": "hi",
+  "author": "sample-user",
+  "url": null
+}
+```
+
+## 9. Additional Notes
+
+### 9.1 Current Optimizations and Caching
+
+The project already includes several practical optimizations:
+
+- Lazy loading of ML components with `lru_cache` to avoid repeated model initialization.
+- On-disk caching of fact embeddings and fact fingerprints in `ml/cache/retrieval`.
+- Automatic index invalidation if the verified fact file changes.
+- Retrieval fallbacks for low-match or cross-lingual edge cases.
+- Fluff filtering before claim extraction and retrieval.
+- Frontend timeout handling for slow cold-start verification requests.
+
+### 9.2 Known Implementation Characteristics
+
+- The current claim extraction route uses simple period-based splitting, while a more advanced ML-backed ingest service also exists in the codebase.
+- The frontend currently proxies only `/verify`; other backend routes are not yet integrated into the UI.
+- Redis and Kafka are present as dependencies and configuration hooks, but they are not yet active parts of the running application.
+
+### 9.3 Future Improvements
+
+- Route post ingestion and claim extraction through the ML-based ingest service by default.
+- Expose additional backend APIs for claim review, similarity search, and fact management.
+- Expand the frontend beyond single-claim verification into a richer analyst dashboard.
+- Add stronger persistence and indexing support for larger fact bases.
+- Introduce explicit vector-store support if the knowledge base grows beyond the current file-based retrieval flow.
+- Add authentication, moderation workflows, and reviewer feedback loops.
+- Extend multilingual coverage beyond English and Hindi to additional Indian languages.
+
+### 9.4 Scaling Considerations
+
+For larger-scale deployment:
+
+- Move from local SQLite to PostgreSQL.
+- Place the fact retrieval index behind a dedicated vector-search system if dataset size increases significantly.
+- Use background workers for ingestion and batch verification.
+- Add Redis-based caching for frequent verify requests.
+- Preload models or run dedicated model-serving processes to avoid cold-start latency.
+
+## 10. Repository Summary
+
+Vernacular Fact-Checker is currently a working full-stack prototype with:
+
+- A FastAPI backend
+- A multilingual ML verification pipeline
+- A React frontend
+- A bilingual verified fact base
+- Local development support for end-to-end claim verification
+
+It is suitable both as a practical demo application and as a foundation for a larger multilingual misinformation analysis platform.
