@@ -10,6 +10,14 @@ Vernacular Fact-Checker is a full-stack multilingual fact-checking system design
 
 The project targets misinformation and unverifiable viral content that appears in English, Hindi, and mixed-language Indian social content. In practice, these posts often include conversational fluff such as emojis, hashtags, forwarding requests, and informal phrasing. The system removes that noise, identifies claim-like text, and performs cross-lingual fact verification without requiring manual translation.
 
+### Key Innovation / USP
+
+- Uses LaBSE multilingual sentence embeddings for direct Hindi-English semantic retrieval, so verification works across languages without an explicit translation service.
+- Combines noisy-social-text normalization (URL/mention/hashtag/emoji and share-forward fluff removal) with claim extraction that falls back from a trained detector to robust heuristics.
+- Runs multilingual NLI verification (`xlm-roberta-large-xnli`) on retrieved evidence and fuses NLI confidence with retrieval-score thresholds to decide Supported, Refuted, or NotEnoughEvidence.
+- Maintains a bilingual, language-tagged verified-facts knowledge base and supports cross-lingual matching where a claim in one language can be verified against evidence in another.
+- Delivers this as an end-to-end production-style stack: React client -> FastAPI `/verify` API -> ML retrieval + verifier pipeline, returning verdict, confidence, and evidence sources in one flow.
+
 ### Current Scope
 
 The repository currently implements:
